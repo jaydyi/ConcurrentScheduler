@@ -18,4 +18,14 @@ public interface ITask<IN, OUT> {
      * @return task result
      */
     OUT doTask(IN param, Map<String, TaskWrapper> taskWrappers);
+
+
+    /**
+     * default result for exception scene
+     *
+     * @return default result
+     */
+    default OUT defaultReturn() {
+        return null;
+    }
 }

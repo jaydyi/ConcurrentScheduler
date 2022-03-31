@@ -4,7 +4,7 @@ public class PreTaskWrapper {
     private TaskWrapper<?, ?> preTaskWrapper;
 
     /**
-     * used to identify the dependency is required or optional.
+     * used to identify the pre dependency is required or optional.
      *
      * one task depend on one more task,
      * the task will launch when any one of the dependency task which isRequired is set to false to execute finish.
