@@ -15,9 +15,9 @@ public enum TaskExecutionStatus {
     TIMEOUT,
 
     /**
-     * task execute error
+     * task execute failed
      */
-    ERROR,
+    FAILED,
 
     /**
      * the default status
