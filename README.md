@@ -1,16 +1,16 @@
-# ConcurrentScheduler description
+# ConcurrentScheduler
 
 
-## Common scenarios of concurrent task schedule
+## 通用场景
 
 
-## ConcurrentScheduler features
+## 设计目标
 
 
-## Anatomy of ConcurrentScheduler
+## 框架解析
 
 
-## Try ConcurrentScheduler
+## 快速开始
 
 
 
