@@ -2,17 +2,17 @@ package com.jaydyi.concurrenttool.standalone;
 
 import com.jaydyi.concurrenttool.standalone.task.TaskWrapper;
 import org.apache.commons.collections.CollectionUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.*;
 
 /**
  * entrypoint
  */
 public class StandaloneAsync {
+    private static final Logger logger = LoggerFactory.getLogger(StandaloneAsync.class);
     /**
      * default cached thread pool.
      */
@@ -23,8 +23,27 @@ public class StandaloneAsync {
      */
     private static ExecutorService executorService;
 
+    /**
+     *
+     * @param timeout : 这个超时时间，会存在一定的误差，在几十毫秒左右;
+     *                超时后，会将任务快速失败，但是处于执行中的线程不会自动退出，会继续执行，只是结果已设置为超时;
+     *                要想执行中的线程也立即结束，只能在main线程，调用StandaloneAsync.shutDownNow()。
+     * @param taskWrappers: 封装的待执行任务
+     * @return
+     */
+    public static boolean start(long timeout, TaskWrapper... taskWrappers) {
+        return start(timeout, DEFAULT_POOL, taskWrappers);
+    }
+
+    public static boolean start(long timeout, ExecutorService executorService, TaskWrapper... taskWrappers) {
+        if (taskWrappers == null || taskWrappers.length == 0) {
+            return false;
+        }
+        return start(timeout, executorService, Arrays.asList(taskWrappers));
+    }
+
     public static boolean start(long timeout, ExecutorService executorService, List<TaskWrapper> taskWrappers) {
-        if (CollectionUtils.isNotEmpty(taskWrappers)) {
+        if (CollectionUtils.isEmpty(taskWrappers)) {
             return false;
         }
         StandaloneAsync.executorService = executorService;
@@ -71,15 +90,14 @@ public class StandaloneAsync {
         shutDown(executorService);
     }
 
+    public static void shutDownNow() {
+        shutDownNow(executorService);
+    }
 
-
-    public static String getTheadPoolTaskInfo() {
-        if (executorService == null) {
-            return "activeCount=" + DEFAULT_POOL.getActiveCount() +
-                    ", completedCount " + DEFAULT_POOL.getCompletedTaskCount() +
-                    ", largestCount " + DEFAULT_POOL.getLargestPoolSize();
-        }
-        return "";
+    public static String getDefaultTheadPoolTaskInfo() {
+        return "activeCount=" + DEFAULT_POOL.getActiveCount() +
+                ", completedCount " + DEFAULT_POOL.getCompletedTaskCount() +
+                ", largestCount " + DEFAULT_POOL.getLargestPoolSize();
     }
 
 
@@ -88,6 +106,14 @@ public class StandaloneAsync {
             executorService.shutdown();
         } else {
             DEFAULT_POOL.shutdown();
+        }
+    }
+
+    private static void shutDownNow(ExecutorService executorService) {
+        if (executorService != null) {
+            executorService.shutdownNow();
+        } else {
+            DEFAULT_POOL.shutdownNow();
         }
     }
 }

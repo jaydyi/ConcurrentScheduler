@@ -1,13 +1,14 @@
 package com.jaydyi.concurrenttool.standalone.task;
 
-import com.jaydyi.concurrenttool.standalone.common.DefaultTaskCallback;
-import com.jaydyi.concurrenttool.standalone.common.ITask;
-import com.jaydyi.concurrenttool.standalone.common.ITaskCallback;
-import com.jaydyi.concurrenttool.standalone.common.TaskResult;
+import com.jaydyi.concurrenttool.standalone.common.*;
+import com.jaydyi.concurrenttool.standalone.exception.SkippedException;
+import org.apache.commons.collections.CollectionUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -99,6 +100,308 @@ public class TaskWrapper<IN, OUT> {
         }
         nextTaskWrappers.add(taskWrapper);
     }
+
+
+    public void run(ExecutorService executorService, long remainTime, Map<String, TaskWrapper> taskWrapperMap) {
+        run(executorService, remainTime, taskWrapperMap, null);
+    }
+
+    public void run(ExecutorService executorService, long remainTime, Map<String, TaskWrapper> taskWrapperMap, TaskWrapper fromTaskWrapper) {
+        this.taskWrapperMap = taskWrapperMap;
+        taskWrapperMap.put(id, this);
+
+        long now = System.currentTimeMillis();
+
+        // 任务链总时间已超时
+        if (remainTime <= 0) {
+            // 快速失败
+            fastFail(INIT, null);
+            // 传递下去
+            beginNext(executorService, now ,remainTime);
+            return;
+        }
+
+        // 存在多条optional pre task时，可能任意一个pre task已触发过了，则直接跳过
+        if (getState() == FINISH || getState() == ERROR) {
+            beginNext(executorService, now, remainTime);
+            return;
+        }
+
+        // 如果子节点，已经开始执行了，则跳过，不要再执行了
+        if (validNextWrapperResultFlag) {
+            if (!isNextHasBegin()) {
+                fastFail(INIT, new SkippedException());
+                beginNext(executorService, now, remainTime);
+                return;
+            }
+        }
+
+        // 没有任何依赖，立即开始执行自己的任务
+        if (CollectionUtils.isEmpty(preTaskWrappers)) {
+            noPreTaskCondition(executorService, now, remainTime);
+            return;
+        }
+
+        // 有依赖, 按序检查前置依赖的完成情况
+        hasPreTasksCondition(executorService, fromTaskWrapper, now, remainTime);
+    }
+
+
+    private boolean isNextHasBegin() {
+        if (CollectionUtils.isEmpty(nextTaskWrappers) || nextTaskWrappers.size() != 1) {
+            // 自己就是最后一个节点或者后面有并行的多个，就返回true
+            return getState() == INIT;
+        }
+        TaskWrapper nextTask = nextTaskWrappers.get(0);
+        return nextTask.getState() == INIT && nextTask.isNextHasBegin();
+    }
+
+    /**
+     * handle no dependency task scene
+     *
+     * @param executorService thread pool
+     * @param start  self task begin time.
+     * @param remainTime remain time
+     */
+    private void noPreTaskCondition(ExecutorService executorService, long start, long remainTime) {
+        beginSelf();
+        beginNext(executorService, start, remainTime);
+    }
+
+    /**
+     * handle has dependency task scene
+     *
+     * @param executorService
+     * @param fromTaskWrapper
+     * @param start
+     * @param remainTime
+     */
+    private synchronized void hasPreTasksCondition(ExecutorService executorService, TaskWrapper fromTaskWrapper, long start, long remainTime) {
+        // it means fromTaskWrapper is task's unique pre task
+        if (preTaskWrappers.size() == 1) {
+            // 失败的话，延续依赖任务失败的状态
+            if (fromTaskWrapper.getTaskResult().getTaskExecutionStatus() == TaskExecutionStatus.TIMEOUT) {
+                defaultTimeOutResult();
+                fastFail(INIT, null);
+            } else if (fromTaskWrapper.getTaskResult().getTaskExecutionStatus() == TaskExecutionStatus.FAILED) {
+                defaultExResult(fromTaskWrapper.getTaskResult().getEx());
+                fastFail(INIT, null);
+            } else {
+                beginSelf();
+                beginNext(executorService, start, remainTime);
+            }
+        } else {
+            // has multiple pre task
+            // pre task has two dependency condition: required or optional
+            // for required tasks, we must wait for all task to be succeed before we can continue.
+            // for optional tasks, we just need to wait for any one of them to be succeed before wo can continue.
+
+            // find out all required pre task wrapper
+            Set<PreTaskWrapper> requiredPreTaskWrapper = new HashSet<>();
+            boolean fromIsRequired = false;
+
+            for (PreTaskWrapper preTaskWrapper: preTaskWrappers) {
+                if (preTaskWrapper.isRequired()) {
+                    requiredPreTaskWrapper.add(preTaskWrapper);
+                }
+                if (preTaskWrapper.getPreTaskWrapper().equals(fromTaskWrapper)) {
+                    fromIsRequired = true;
+                }
+            }
+
+            if (requiredPreTaskWrapper.size() == 0) {
+                if (fromTaskWrapper.getTaskResult().getTaskExecutionStatus() == TaskExecutionStatus.TIMEOUT) {
+                    fastFail(INIT, null);
+                } else {
+                    beginSelf();
+                }
+                beginNext(executorService, start, remainTime);
+                return;
+            }
+
+            // besides fromTaskWrapper, there is required task wrapper, so wait an return
+            if (!fromIsRequired) {
+                return;
+            }
+
+            // check required pre task
+            boolean hasFailed = false;
+            boolean hasNotFinished = false;
+
+            for (PreTaskWrapper requiredPreTask: requiredPreTaskWrapper) {
+                TaskWrapper taskWrapper = requiredPreTask.getPreTaskWrapper();
+                TaskResult taskWrapperResult = taskWrapper.getTaskResult();
+
+                if (taskWrapper.getState() == INIT || taskWrapper.getState() == WORKING) {
+                    hasNotFinished = true;
+                    break;
+                }
+                if (taskWrapperResult.getTaskExecutionStatus() == TaskExecutionStatus.TIMEOUT) {
+                    defaultTimeOutResult();
+                    hasFailed = true;
+                    break;
+                }
+                if (taskWrapperResult.getTaskExecutionStatus() == TaskExecutionStatus.FAILED) {
+                    defaultExResult(taskWrapperResult.getEx());
+                    hasFailed = true;
+                    break;
+                }
+            }
+
+            // has required pre task failed, fast fail and transfer
+            if (hasFailed) {
+                fastFail(INIT, null);
+                beginNext(executorService, start, remainTime);
+                return;
+            }
+
+            // has not finished pre task, return
+            if (hasNotFinished) {
+                return;
+            }
+
+            beginSelf();
+            beginNext(executorService, start, remainTime);
+        }
+    }
+
+    public void beginNext(ExecutorService executorService, long start, long remainTime) {
+        long costTime  = System.currentTimeMillis() - start;
+        if (CollectionUtils.isEmpty(nextTaskWrappers)) {
+            return;
+        }
+        if (nextTaskWrappers.size() == 1) {
+            // 后续只有一个任务待执行，复用当前线程
+            nextTaskWrappers.get(0).run(executorService, remainTime - costTime, taskWrapperMap, this);
+            return;
+        }
+
+        // 有多个后续任务，往线程池里丢，去并发执行
+        CompletableFuture[] futures = new CompletableFuture[nextTaskWrappers.size()];
+        for (int i = 0; i < nextTaskWrappers.size(); i++) {
+            final int fi = i;
+            futures[i] = CompletableFuture.runAsync(
+                    () -> nextTaskWrappers.get(fi)
+                            .run(executorService, remainTime - costTime, taskWrapperMap, this),
+                    executorService);
+        }
+        try {
+            CompletableFuture.allOf(futures).get();
+        } catch (InterruptedException | ExecutionException e) {
+            logger.error("beginNext wait all next task execute exception.", e);
+        }
+    }
+
+
+    // 存在多线程的竞争，需要避免重复执行
+    public void beginSelf() {
+        if (!verifyIsNullResult()) {
+            // if taskResult is not null, it means task has executed, should directly return, avoid repeat execution.
+            return;
+        }
+
+        try {
+            if (!compareAndSetState(INIT, WORKING)) {
+                // taskResult is null and task state is not init, it means task is executing, should directly return, avoid repeat execution.
+                return;
+            }
+
+            //
+            callback.begin();
+
+            OUT result = task.doTask(param, taskWrapperMap);
+
+            if (!compareAndSetState(WORKING, FINISH)) {
+                // 加一重保护，避免重复执行
+                return;
+            }
+
+            taskResult.setTaskExecutionStatus(TaskExecutionStatus.SUCCESS);
+            taskResult.setResult(result);
+
+            callback.result(param, taskResult);
+        } catch (Exception e) {
+            if (!verifyIsNullResult()) {
+                // 有其它线程执行完毕，直接使用结果
+                return;
+            }
+            fastFail(WORKING, e);
+        }
+    }
+
+    // 默认是超时快速失败
+    private boolean fastFail(int fromState, Exception e) {
+        if (!compareAndSetState(fromState, ERROR)) {
+            return false;
+        }
+        if (verifyIsNullResult()) {
+            if (e == null) {
+                // 非异常的快速退出，只对应超时场景
+                defaultTimeOutResult();
+            } else {
+                defaultExResult(e);
+            }
+        }
+
+        callback.result(param, taskResult);
+        return true;
+    }
+
+    private void defaultTimeOutResult() {
+        taskResult.setResult(task.defaultReturn());
+        taskResult.setTaskExecutionStatus(TaskExecutionStatus.TIMEOUT);
+    }
+
+    private void defaultExResult(Exception e) {
+        taskResult.setResult(task.defaultReturn());
+        taskResult.setTaskExecutionStatus(TaskExecutionStatus.FAILED);
+        taskResult.setEx(e);
+    }
+
+
+
+
+    private boolean verifyIsNullResult() {
+        return taskResult.getTaskExecutionStatus() == TaskExecutionStatus.DEFAULT;
+    }
+
+    public void stopNow() {
+        if (getState() == INIT || getState() == WORKING) {
+            fastFail(getState(), null);
+        }
+    }
+
+    public static void showTaskDAG(TaskWrapper... taskWrapper) {
+        if (null == taskWrapper) {
+            return;
+        }
+        logger.info("begin to show task DAG:");
+        Deque<TaskWrapper> deque = new ArrayDeque<>();
+        for (TaskWrapper tmp: taskWrapper) {
+            deque.offer(tmp);
+        }
+
+        while (!deque.isEmpty()) {
+            int num = deque.size();
+            while (num --> 0) {
+                TaskWrapper wrapper = deque.poll();
+                if (wrapper.getNextWrappers() != null) {
+                    for (Object next: wrapper.getNextWrappers()) {
+                        if (next != null) {
+                            deque.offer((TaskWrapper)next);
+                            logger.info("{} -> {}", wrapper.getId(), ((TaskWrapper)next).getId());
+                        }
+                    }
+                }
+            }
+        }
+        logger.info("end show task DAG.");
+    }
+
+
+    // ==============================================================
+    //  builder define
+    // ==============================================================
 
     public static class Builder<BIN, BOUT> {
         /**
@@ -195,7 +498,7 @@ public class TaskWrapper<IN, OUT> {
             return next(wrapper, true);
         }
 
-        public Builder<BIN, BOUT> next(TaskWrapper<?, ?> wrapper, boolean isRequired) {
+        public Builder<BIN, BOUT> next(TaskWrapper<?, ?> wrapper, boolean selfIsRequired) {
             if (wrapper == null) {
                 return this;
             }
@@ -204,7 +507,7 @@ public class TaskWrapper<IN, OUT> {
             }
             nextTaskWrappers.add(wrapper);
 
-            if (isRequired) {
+            if (selfIsRequired) {
                 if (selfIsRequiredSet == null) {
                     selfIsRequiredSet = new HashSet<>();
                 }
@@ -258,15 +561,9 @@ public class TaskWrapper<IN, OUT> {
 
 
 
-
-    public void run(ExecutorService executorService, long remainTime, Map<String, TaskWrapper> taskWrapperMap) {
-
-    }
-
-    public void stopNow() {
-
-    }
-
+    // ==============================================================
+    //  bean define
+    // ==============================================================
 
     public String getId() {
         return id;
@@ -324,6 +621,14 @@ public class TaskWrapper<IN, OUT> {
         this.validNextWrapperResultFlag = validNextWrapperResultFlag;
     }
 
+    public int getState() {
+        return state.get();
+    }
+
+    public boolean compareAndSetState(int expect, int update) {
+        return state.compareAndSet(expect, update);
+    }
+
     public String getName() {
         return name;
     }
@@ -332,30 +637,7 @@ public class TaskWrapper<IN, OUT> {
         this.name = name;
     }
 
-    public static void showTaskDAG(TaskWrapper taskWrapper) {
-        if (null == taskWrapper) {
-            return;
-        }
-        logger.info("begin to show task DAG:");
-        Deque<TaskWrapper> deque = new ArrayDeque<>();
-        deque.offer(taskWrapper);
-
-        while (!deque.isEmpty()) {
-            int num = deque.size();
-            while (num --> 0) {
-                TaskWrapper wrapper = deque.poll();
-                if (wrapper.getNextWrappers() != null) {
-                    for (Object next: wrapper.getNextWrappers()) {
-                        if (next != null) {
-                            deque.offer((TaskWrapper)next);
-                            logger.info("{} -> {}", wrapper.getName(), ((TaskWrapper)next).getName());
-                        }
-                    }
-                }
-            }
-        }
-        logger.info("end show task DAG.");
+    public TaskResult<OUT> getTaskResult() {
+        return taskResult;
     }
-
-
 }
