@@ -12,7 +12,6 @@
     <properties>
         <maven.compiler.source>8</maven.compiler.source>
         <maven.compiler.target>8</maven.compiler.target>
-        <commons.collections.version>3.2.2</commons.collections.version>
         <logback.version>1.2.3</logback.version>
         <slf4j.api.version>1.7.32</slf4j.api.version>
     </properties>
